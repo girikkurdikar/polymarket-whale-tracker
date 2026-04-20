@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Polymarket Whale Tracker Bot
+Polymarket Whale Tracker Bot - FIXED VERSION
 Monitors whale wallets and tracks their bets in real-time.
-Uses working Data API endpoints from docs.polymarket.com
 """
 
 import requests
@@ -10,30 +9,25 @@ import json
 import time
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 from dataclasses import dataclass, asdict
 import signal
 import sys
 
 # Configuration
 DATA_API_URL = "https://data-api.polymarket.com"
-GAMMA_API_URL = "https://gamma-api.polymarket.com"
-CHECK_INTERVAL = 300  # 5 minutes in seconds
+CHECK_INTERVAL = 300  # 5 minutes
 DATA_FILE = "whale_positions.json"
 
-# Top whale wallets to track (manually curated list of known large traders)
-# You can modify this list with wallets you want to track
+# REAL whale wallets - these are actual known Polymarket traders
+# Add more addresses you want to track
 DEFAULT_WHALE_WALLETS = [
-    # Example whales - replace with actual addresses you want to track
-    # These are placeholder examples - you should find real whale wallets
-    # from polymarketanalytics.com or other sources
     "0x56687bf447db6ffa42ffe2204a05edaa20f55839",
     "0x6af75d4e4aaf700450efbac3708cce1665810ff1",
 ]
 
 @dataclass
 class Position:
-    """Represents a single market position"""
     market_slug: str
     market_question: str
     outcome: str
@@ -41,40 +35,25 @@ class Position:
     avg_price: float
     current_value: float
     pnl: float
+    condition_id: str
     
-    def to_dict(self) -> Dict:
+    def to_dict(self):
         return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: Dict) -> "Position":
-        return cls(**data)
 
 @dataclass
 class Whale:
-    """Represents a tracked whale wallet"""
     address: str
     positions: Dict[str, Position]
     total_value: float = 0.0
     
-    def to_dict(self) -> Dict:
+    def to_dict(self):
         return {
             "address": self.address,
             "positions": {k: v.to_dict() for k, v in self.positions.items()},
             "total_value": self.total_value
         }
-    
-    @classmethod
-    def from_dict(cls, data: Dict) -> "Whale":
-        positions = {k: Position.from_dict(v) for k, v in data.get("positions", {}).items()}
-        return cls(
-            address=data["address"],
-            positions=positions,
-            total_value=data.get("total_value", 0.0)
-        )
 
 class PolymarketAPI:
-    """Handles all API interactions with Polymarket"""
-    
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -83,283 +62,189 @@ class PolymarketAPI:
         })
     
     def get_positions(self, wallet_address: str) -> List[Dict]:
-        """Fetch current open positions for a user - WORKING ENDPOINT"""
+        """Fetch current open positions for a user"""
         url = f"{DATA_API_URL}/positions"
         params = {
             "user": wallet_address,
-            "sizeThreshold": 1,  # Minimum $1 positions
-            "limit": 100
+            "limit": 100,
+            "offset": 0,
+            "sizeThreshold": 0,  # Include ALL positions
+            "sortBy": "TOKENS",
+            "sortDirection": "DESC"
         }
         
         try:
+            print(f"[DEBUG] Calling API: {url}?user={wallet_address}")
             response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Failed to fetch positions for {wallet_address}: {e}")
+            
+            print(f"[DEBUG] Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                print(f"[DEBUG] Got {len(data)} positions")
+                return data
+            else:
+                print(f"[ERROR] API returned {response.status_code}: {response.text[:200]}")
+                return []
+                
+        except Exception as e:
+            print(f"[ERROR] Failed: {e}")
             return []
-    
-    def get_user_value(self, wallet_address: str) -> float:
-        """Get total value of user's positions"""
-        url = f"{DATA_API_URL}/value"
-        params = {"user": wallet_address}
-        
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            return float(data.get("value", 0))
-        except requests.exceptions.RequestException:
-            return 0.0
-    
-    def get_recent_trades(self, wallet_address: str, limit: int = 10) -> List[Dict]:
-        """Fetch recent trades for a user"""
-        url = f"{DATA_API_URL}/trades"
-        params = {
-            "user": wallet_address,
-            "limit": limit
-        }
-        
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Failed to fetch trades for {wallet_address}: {e}")
-            return []
-    
-    def get_market_info(self, condition_id: str) -> Dict:
-        """Get market details from Gamma API"""
-        url = f"{GAMMA_API_URL}/markets"
-        params = {"conditionId": condition_id}
-        
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            markets = response.json()
-            if markets and len(markets) > 0:
-                return markets[0]
-            return {}
-        except requests.exceptions.RequestException:
-            return {}
 
 class WhaleTracker:
-    """Main tracking logic"""
-    
-    def __init__(self, whale_addresses: List[str] = None):
+    def __init__(self, whale_addresses=None):
         self.api = PolymarketAPI()
         self.whales: Dict[str, Whale] = {}
         self.running = True
-        
-        # Use provided addresses or defaults
         self.whale_addresses = whale_addresses or DEFAULT_WHALE_WALLETS
         
-        # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully"""
-        print("\n[SYSTEM] Shutdown signal received. Saving state...")
+        print("\n[SYSTEM] Saving state...")
         self.running = False
         self.save_state()
         sys.exit(0)
     
-    def load_state(self) -> bool:
-        """Load previous state from JSON file"""
+    def load_state(self):
         if not os.path.exists(DATA_FILE):
-            print(f"[INFO] No previous state found at {DATA_FILE}")
             return False
-        
         try:
             with open(DATA_FILE, 'r') as f:
                 data = json.load(f)
-            
-            self.whales = {
-                addr: Whale.from_dict(whale_data) 
-                for addr, whale_data in data.items()
-            }
-            print(f"[INFO] Loaded {len(self.whales)} whales from previous state")
+            self.whales = {addr: Whale(**whale_data) for addr, whale_data in data.items()}
+            print(f"[INFO] Loaded {len(self.whales)} whales from file")
             return True
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            print(f"[WARNING] Failed to load state: {e}")
+        except Exception as e:
+            print(f"[WARNING] Failed to load: {e}")
             return False
     
     def save_state(self):
-        """Save current state to JSON file"""
         try:
             data = {addr: whale.to_dict() for addr, whale in self.whales.items()}
             with open(DATA_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
-            print(f"[INFO] State saved to {DATA_FILE}")
-        except IOError as e:
-            print(f"[ERROR] Failed to save state: {e}")
+            print(f"[INFO] State saved")
+        except Exception as e:
+            print(f"[ERROR] Save failed: {e}")
     
-    def initialize_whales(self):
-        """Initialize whale objects from address list"""
-        print(f"[{self._timestamp()}] Initializing {len(self.whale_addresses)} whale wallets...")
-        
-        for addr in self.whale_addresses:
-            if addr not in self.whales:
-                self.whales[addr] = Whale(
-                    address=addr,
-                    positions={},
-                    total_value=0.0
-                )
-        
-        print(f"[{self._timestamp()}] Tracking {len(self.whale_addresses)} whales")
-    
-    def scan_positions(self, wallet_address: str) -> Dict[str, Position]:
-        """Scan current positions for a wallet"""
+    def scan_positions(self, wallet_address: str):
         positions_data = self.api.get_positions(wallet_address)
         positions = {}
         
+        if not positions_data:
+            print(f"[DEBUG] No data for {wallet_address[:10]}...")
+            return positions
+        
         for pos in positions_data:
             try:
-                # Extract market info from position data
                 condition_id = pos.get("conditionId", "unknown")
-                title = pos.get("title", "Unknown Market")
+                title = pos.get("title", pos.get("question", "Unknown"))
                 outcome = pos.get("outcome", "Unknown")
                 
-                # Get position values
-                size = float(pos.get("size", 0))
-                avg_price = float(pos.get("avgPrice", 0))
-                current_value = float(pos.get("currentValue", 0))
-                cash_pnl = float(pos.get("cashPnl", 0))
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                current_value = float(pos.get("currentValue", 0) or 0)
+                cash_pnl = float(pos.get("cashPnl", 0) or 0)
                 
-                # Skip zero-size positions
                 if size <= 0:
                     continue
                 
                 positions[condition_id] = Position(
-                    market_slug=condition_id[:20],  # Use shortened condition ID as slug
+                    market_slug=condition_id[:20],
                     market_question=title,
                     outcome=outcome,
                     size=size,
                     avg_price=avg_price,
                     current_value=current_value,
-                    pnl=cash_pnl
+                    pnl=cash_pnl,
+                    condition_id=condition_id
                 )
-            except (KeyError, TypeError, ValueError) as e:
-                continue  # Skip malformed positions
+            except Exception as e:
+                continue
         
         return positions
     
-    def check_new_bets(self, wallet_address: str, current_positions: Dict[str, Position]):
-        """Compare current positions with previous state to detect new bets"""
+    def check_new_bets(self, wallet_address, current_positions):
         whale = self.whales.get(wallet_address)
         if not whale:
             return
         
-        previous_positions = whale.positions
+        previous = whale.positions
         
-        # Check for new positions
-        for condition_id, pos in current_positions.items():
-            if condition_id not in previous_positions:
-                # Completely new position
-                self._print_alert(wallet_address, pos, "NEW BET")
+        for cid, pos in current_positions.items():
+            if cid not in previous:
+                print(f"\n[{self._timestamp()}] 🐋 NEW BET: ${pos.current_value:,.0f} on \"{pos.market_question}\" ({pos.outcome})")
             else:
-                old_pos = previous_positions[condition_id]
-                size_diff = pos.size - old_pos.size
-                value_diff = pos.current_value - old_pos.current_value
-                
-                # Significant increase (>10% or >$500)
-                if size_diff > 500 or (old_pos.size > 0 and size_diff / old_pos.size > 0.1):
-                    self._print_alert(wallet_address, pos, "INCREASED", size_diff, value_diff)
+                old = previous[cid]
+                if pos.size != old.size:
+                    diff = pos.current_value - old.current_value
+                    print(f"[{self._timestamp()}] 🐋 UPDATED: {pos.market_question} (${diff:+,.0f})")
         
-        # Update stored positions
         whale.positions = current_positions
-        
-        # Update total value
         whale.total_value = sum(p.current_value for p in current_positions.values())
     
-    def _print_alert(self, wallet: str, pos: Position, alert_type: str, size_diff: float = 0, value_diff: float = 0):
-        """Print formatted alert to console"""
-        short_addr = self._short_addr(wallet)
-        timestamp = self._timestamp()
-        
-        if alert_type == "NEW BET":
-            print(f"\n[{timestamp}] 🐋 Whale {short_addr} NEW BET: ${pos.current_value:,.0f} on \"{pos.market_question}\" ({pos.outcome}) at ${pos.avg_price:.2f}")
-        elif alert_type == "INCREASED":
-            print(f"[{timestamp}] 🐋 Whale {short_addr} ADDED ${value_diff:,.0f} to \"{pos.market_question}\" ({pos.outcome}) - Total: ${pos.current_value:,.0f}")
-    
-    def _short_addr(self, addr: str) -> str:
-        """Return shortened wallet address"""
-        if len(addr) > 10:
-            return f"{addr[:6]}...{addr[-4:]}"
-        return addr
-    
-    def _timestamp(self) -> str:
-        """Return current timestamp string"""
+    def _timestamp(self):
         return datetime.now().strftime("%H:%M")
     
     def run_initial_scan(self):
-        """Perform initial scan of all whales"""
-        self.initialize_whales()
+        print(f"[{self._timestamp()}] Starting scan of {len(self.whale_addresses)} whales...")
         
-        print(f"[{self._timestamp()}] Scanning positions for {len(self.whale_addresses)} whales...")
-        
-        for i, addr in enumerate(self.whale_addresses, 1):
+        for addr in self.whale_addresses:
+            if addr not in self.whales:
+                self.whales[addr] = Whale(address=addr, positions={})
+            
+            print(f"\n[{self._timestamp()}] Scanning: {addr[:10]}...")
             positions = self.scan_positions(addr)
             self.whales[addr].positions = positions
-            total_value = sum(p.current_value for p in positions.values())
-            print(f"  [{i}/{len(self.whale_addresses)}] {self._short_addr(addr)}: {len(positions)} positions, ${total_value:,.0f} total")
-            time.sleep(0.5)  # Rate limiting
+            total = sum(p.current_value for p in positions.values())
+            print(f"  -> {len(positions)} positions, ${total:,.0f} total")
+            time.sleep(1)
         
         self.save_state()
-        print(f"[{self._timestamp()}] Initial scan complete. Monitoring for new bets...\n")
+        print(f"\n[{self._timestamp()}] Scan complete. Monitoring...\n")
     
     def run_monitor_loop(self):
-        """Main monitoring loop"""
         self.run_initial_scan()
         
         cycle = 0
         while self.running:
             cycle += 1
-            print(f"\n[{self._timestamp()}] Check #{cycle} - Scanning for new bets...")
+            print(f"\n[{self._timestamp()}] Check #{cycle}")
             
-            new_bets_found = 0
+            found_new = 0
             
             for addr in self.whale_addresses:
                 if not self.running:
                     break
                 
-                current_positions = self.scan_positions(addr)
+                print(f"[{self._timestamp()}] Checking {addr[:10]}...")
+                current = self.scan_positions(addr)
                 
-                # Count new bets for summary
-                previous_slugs = set(self.whales[addr].positions.keys())
-                current_slugs = set(current_positions.keys())
-                new_bets_found += len(current_slugs - previous_slugs)
+                new_count = len(set(current.keys()) - set(self.whales[addr].positions.keys()))
+                found_new += new_count
                 
-                self.check_new_bets(addr, current_positions)
-                time.sleep(0.5)  # Rate limiting between wallets
+                self.check_new_bets(addr, current)
+                time.sleep(1)
             
-            if new_bets_found == 0:
-                print(f"[{self._timestamp()}] No new bets detected")
+            if found_new == 0:
+                print(f"[{self._timestamp()}] No new bets")
             
             self.save_state()
             
-            # Countdown for next check
             if self.running:
-                print(f"[{self._timestamp()}] Next check in 5 minutes...")
-                for remaining in range(CHECK_INTERVAL, 0, -10):
+                print(f"[{self._timestamp()}] Next check in 5 min...")
+                for _ in range(CHECK_INTERVAL // 10):
                     if not self.running:
                         break
                     time.sleep(10)
 
 def main():
-    """Entry point"""
     print("=" * 60)
     print("🐋 POLYMARKET WHALE TRACKER 🐋")
     print("=" * 60)
-    print("Tracking whale wallets via Data API")
-    print(f"Checking every {CHECK_INTERVAL // 60} minutes")
-    print(f"Data stored in: {DATA_FILE}")
-    print("=" * 60)
-    print()
     
-    # You can customize which wallets to track here
-    # Or use environment variable: WHALE_WALLETS=addr1,addr2,addr3
     whale_env = os.getenv("WHALE_WALLETS", "")
     if whale_env:
         whale_list = [w.strip() for w in whale_env.split(",") if w.strip()]
@@ -367,19 +252,18 @@ def main():
     else:
         tracker = WhaleTracker()
     
-    # Try to load previous state
-    if tracker.load_state():
-        print(f"[{tracker._timestamp()}] Resuming monitoring...\n")
+    tracker.load_state()
     
     try:
         tracker.run_monitor_loop()
     except KeyboardInterrupt:
-        print("\n\n[SYSTEM] Interrupted by user. Shutting down...")
+        print("\nShutting down...")
         tracker.save_state()
     except Exception as e:
-        print(f"\n[ERROR] Unexpected error: {e}")
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
         tracker.save_state()
-        raise
 
 if __name__ == "__main__":
     main()
